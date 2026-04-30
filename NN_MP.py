@@ -1,4 +1,20 @@
+"""
+DEM calibration workflow using an MLP surrogate model and Dual Annealing.
 
+The script iteratively calibrates microscopic DEM material parameters
+against target macroscopic responses from UCS and Brazilian tensile tests.
+
+General workflow:
+1. Read previously computed DEM material-response data.
+2. Normalize microscopic material parameters.
+3. Compute an objective/fitness value from the difference between simulated
+   and target macroscopic responses.
+4. Train an MLPRegressor surrogate model on the current data.
+5. Use Dual Annealing to search the surrogate surface for improved parameters.
+6. Run new DEM/MUSEN simulations for the proposed parameters.
+7. Append new results to the calibration database.
+8. Periodically compare surrogate-calibrated results with direct MUSEN tests.
+"""
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPRegressor
 from sklearn.metrics import mean_squared_error
@@ -14,6 +30,19 @@ import pandas as pd
 #from mpl_toolkits.mplot3d import Axes3D
 
 async def run_program(command):
+    """
+    Run one external DEM simulation command asynchronously.
+
+    Parameters
+    ----------
+    command : list[str]
+        Command-line arguments used to launch RockFit-DEM or MUSEN.
+
+    Returns
+    -------
+    stdout_str, stderr_str : tuple[str, str]
+        Text output of the external process.
+    """
     # Create the subprocess with stdout and stderr pipes
     proc = await asyncio.create_subprocess_exec(
         *command,
@@ -40,10 +69,21 @@ async def put_task_queue(p_Commands, p_Queue, p_flags):
             return # Perform actions when the element is not found, e.g., do something else, return a default value, etc.
 
 async def run_tasks(p_Commands, p_NSimultaneousTasks, p_indexGPUs, p_Queue, p_TemplatePattern, p_ResultMaterialDataPoints, p_FilePath, p_WriteResult=True):
+    """
+    Run a batch of DEM simulations in parallel on available GPUs.
+
+    Each command is assigned a GPU index and a unique simulation index.
+    When a simulation finishes, its stdout is parsed for:
+    - the simulation index,
+    - the GPU that became free,
+    - the calculated material-response vector.
+
+    The parsed result is appended to ResultMaterial.txt.
+    """
     #l_flags = [0] * p_NSimultaneousTasks
     l_mainindex = 0
-    l_taskpattern = r'INDEX (\d+)'
-    l_TemplateGPUPattern = r'Correct GPU request! Requested:\s+(\d+)'
+    l_taskpattern = r'INDEX (\d+)' # Pattern used to recover the unique simulation index from stdout.
+    l_TemplateGPUPattern = r'Correct GPU request! Requested:\s+(\d+)' # Pattern used to identify which GPU has finished and can receive another task.
     l_i = 0
     #l_QueueFlags = []
     l_indextasks = {}        
@@ -259,6 +299,13 @@ async def rerun_tasks(p_Commands, p_NSimultaneousTasks, p_indexGPUs, p_Queue, p_
     p_Queue.clear()
 
 def SetNTasks(p_Commands, p_N, p_MaterialBorderParameters, p_MaterialFixParameters, p_Command, p_NParameters, p_NFixParameters):
+    """
+    Generate N random DEM simulations by sampling material parameters
+    uniformly within prescribed bounds.
+
+    The generated material parameters are inserted into the command-line
+    argument M(...), while the target macroscopic response is inserted into T(...).
+    """
     l_material = np.zeros(p_NParameters+p_NFixParameters, dtype = np.float64)
     #print(l_material)
     for l_j in range(0,p_N):
@@ -278,6 +325,13 @@ def SetNTasks(p_Commands, p_N, p_MaterialBorderParameters, p_MaterialFixParamete
     #print(p_Commands)
     
 def SetNTasksVariation(p_Commands, p_N, p_MaterialBorderParameters, p_MaterialFixParameters, p_MaterialParameters, p_Variation, p_Command, p_NParameters, p_NFixParameters):
+    """
+    Generate a local cloud of simulations around the current best material point.
+
+    The first command uses the proposed material parameters directly.
+    The remaining commands randomly perturb each calibrated parameter within
+    ±p_Variation, clipped to the global material-parameter bounds.
+    """
     l_material = np.zeros(p_NParameters+p_NFixParameters, dtype = np.float64)
     l_Command = p_Command.copy()
     for l_i in range(0,p_NParameters):
@@ -313,7 +367,10 @@ def SetNTasksVariation(p_Commands, p_N, p_MaterialBorderParameters, p_MaterialFi
         #p_Queue.put_nowait(run_program(p_Command))
     #print(p_Commands)
         
-
+# Surrogate model:
+# maps normalized microscopic DEM parameters to the scalar calibration objective.
+# Inputs: normalized material parameters.
+# Output: normalized objective/fitness value.
 mlp = MLPRegressor(
     hidden_layer_sizes=[300,500,900,500,300],
     max_iter=20000,
@@ -325,6 +382,13 @@ def z(x,y):
 
 counter = 0
 def Material_Surface(x):
+    """
+    Objective function passed to Dual Annealing.
+
+    Instead of running a DEM simulation directly, this function evaluates
+    the trained MLP surrogate at the candidate normalized parameter vector x.
+    Dual Annealing therefore searches the surrogate-predicted calibration error.
+    """
     global counter
     global mlp
     counter+=1
@@ -342,12 +406,21 @@ def readfile_ResultMaterial(filename):
     return np.array(DataPoints)
     
 def NormalizedParameters(p_Array, p_NormalizationCoefficients, p_NParameters):
+    """
+    Convert physical DEM parameters to normalized parameters used for ML training.
+
+    Example:
+    Young's modulus, bond strengths, and bond radius may differ by many orders
+    of magnitude, so normalization prevents large-scale parameters from
+    dominating the MLP training.
+    """
     l_A = []
     for l_i in range(0, p_NParameters):
         l_A.append(p_Array[l_i]/p_NormalizationCoefficients[l_i])
     #l_A.append(p_Array[4])
     return l_A
 
+# Convert normalized optimizer output back to physical DEM parameters.
 def ReNormalizedParameters(p_Array, p_NormalizationCoefficients, p_NParameters):
     l_A = []
     for l_i in range(0, p_NParameters):
@@ -386,6 +459,19 @@ def FullNormalizedResult2(p_Array):
     return l_A
     
 def ReCalculateTargetFunctional(p_XY, p_TargetResult, p_WeightResult):
+    """
+    Compute the scalar calibration objective for each simulated material point.
+
+    The objective compares simulated macroscopic quantities with target values.
+    Relative errors are squared and multiplied by user-defined weights.
+
+    Special penalty rules are applied to selected response components:
+    - component 3 appears to penalize unacceptable deformation/damage behavior,
+    - component 5 appears to penalize Brazilian-test-related mismatch.
+
+    The objective is capped to avoid extremely large penalties dominating
+    the training set.
+    """
     Y = []
     l_i = 0
     for l_x in p_XY:
@@ -418,6 +504,16 @@ def ReCalculateTargetFunctional(p_XY, p_TargetResult, p_WeightResult):
     return Y
     
 def GetNewArrayOfPoints(p_X, p_Y, p_Variation, p_externalVariation, p_NMinPoints, p_NParameters):
+    """
+    Select training points near the current best material parameter set.
+
+    The best point is the point with the minimum objective value.
+    A local parameter window is constructed around it.
+    Existing points inside the wider window are retained for surrogate training.
+
+    If too few local points are available, the function returns the number of
+    additional random DEM simulations required to enrich the local database.
+    """
     l_V0 = 1.0-p_Variation
     l_V1 = 1.0+p_Variation    
     l_rowindex_min = np.argmin(p_Y)
@@ -524,6 +620,14 @@ materialprop=['YOUNG_MODULUS', 'NORMAL_STRENGTH', 'TANGENTIAL_STRENGTH', 'DENSIT
    
 
 def read_CT(p_result, i_var, j_var):
+    """
+    Read MUSEN compression-test output and extract peak axial response.
+
+    The function reads displacement and force from the exported CSV file.
+    It stores:
+    p_result[0] = axial strain at peak force,
+    p_result[1] = compressive strength estimated from peak force / specimen area.
+    """
 #np.float64
     nameF = './MUSEN_calc/CompressionTest_{jj}_{ii}.csv'.format(ii=i_var, jj=j_var)
     df = pd.read_csv(nameF, sep='; ', header=0, dtype=object, na_filter=True, usecols=['Z[m]', 'Z[N]'], engine='python', na_values = "-nan(ind)")
@@ -542,6 +646,12 @@ def read_CT(p_result, i_var, j_var):
     return 0
     
 def read_BT(p_result, i_var, j_var):
+    """
+    Read MUSEN Brazilian-test output and extract peak tensile-strength proxy.
+
+    The function reads the maximum force and converts it to an equivalent
+    Brazilian tensile stress using the specimen geometry.
+    """
     nameF = './MUSEN_calc/BrasilTest_{jj}_{ii}.csv'.format(ii=i_var, jj=j_var)
     df = pd.read_csv(nameF, sep='; ', header=0, dtype=object, na_filter=True, usecols=['Z[m]', 'Z[N]'], engine='python', na_values = "-nan(ind)")
     maxF=0
@@ -560,6 +670,15 @@ def read_BT(p_result, i_var, j_var):
     return 0
     
 def save_CT_script(p_material, i_var, j_var):
+    """
+    Write a MUSEN script for a uniaxial compression test.
+
+    The script:
+    1. Generates bonds in the sample.
+    2. Assigns calibrated material properties.
+    3. Runs the GPU simulator.
+    4. Exports force-displacement data for post-processing.
+    """
 #np.float64
     global materialprop
     nameF = './MUSEN_calc/ScriptCT_{jj}_{ii}.dat'.format(ii=i_var, jj=j_var)
@@ -652,6 +771,8 @@ async def main():
     TemplatePattern = r"ResultCalculateOneSample\[(.*?)\]"
     NParameters = 4
     #TargetResult = [0.00480002*(0.0158726/0.0132), 104.0497482e6*(281.709/311.21), 1.0, 0.1, 10.5e6, 0.05]
+    # Target macroscopic response for chalk from Talesnick et al.:
+    # [UCT strain, UCT stress, ..., BT stress, ...]
     TargetResult = np.array([0.00480002, 104.0497482e6, 1.0, 0.1, 10.5e6, 0.05]) #(0.00356305/0.0056), (72.4896/175.412),(6.02892/17.113)
     WeightResult = [1, 1, 5000, 1, 1, 1] #[50, 100, 10000, 1]
     #CoeffToMusen = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
@@ -666,9 +787,10 @@ async def main():
     CoeffToMusen = np.array([0.60354167, 0.33116822, 1.0, 1.0, 0.32046037, 1.0])#[4.48848e+11 4.39594e+08 9.73767e+08 7.56476e-05 5.00000e-04 3.90000e-01]  |  [4.80000000e-03 1.10428168e+08 1.02182057e+07]
     MusenResult = np.zeros(3, dtype = np.float64)
     Variation = 1.0 + 0.30
+    # Calibrated microscopic DEM parameters: # 0: Young's modulus; # 1: normal bond strength; # 2: tangential bond strength; # 3: bond diameter
     MaterialBorderParameters = [(1.5e+10, 3.5e11), (1e7, 1e11), (1e7, 1e11), (1e-6,0.9e-3)]
     #MaterialBorderParameters = [(1.7e+10, 1.8e+10), (6e+8, 6.5e+8), (5e+8, 5.2e+8), (4e-4,4.2e-4)]
-    MaterialFixParameters = [5e-4, 0.39]
+    MaterialFixParameters = [5e-4, 0.39] # Fixed DEM parameters that are not optimized in this calibration run: bond diameter and porosity
     NFixParameters = 2
     NParamAll = NParameters+NFixParameters
     NormalizationCoefficients = [2e11, 1e9, 1e9, 5e-4, 20]
@@ -689,13 +811,13 @@ async def main():
     l_fsc = check_if_samples_created()
     print('l_fsc', l_fsc)
     if len(l_fsc) > 0:
-        x0_train = [tuple(NormalizedParameters(e[:NParameters], NormalizationCoefficients, NParameters)) for e in ResultMaterialDataPoints]
+        x0_train = [tuple(NormalizedParameters(e[:NParameters], NormalizationCoefficients, NParameters)) for e in ResultMaterialDataPoints] # 1. Build the current training dataset from all available DEM results.
         xy0_train = [np.concatenate((e[NParamAll:NParamAll+4],e[NParamAll+5:NParamAll+6],e[NParamAll+7:NParamAll+8])) for e in ResultMaterialDataPoints]
         CorrectedTargetResult = TargetResult*CoeffToMusen
         print('CorrectedTargetResult ', l_i, ' | ', CorrectedTargetResult)
         print('CoeffToMusen ', CoeffToMusen)
-        y0_train = NormalizedResult(ReCalculateTargetFunctional(xy0_train, CorrectedTargetResult, WeightResult), NormalizationCoefficients[NParameters])
-        NAPoints, x_train, y_train, x_border, iBestParameters = GetNewArrayOfPoints(x0_train, y0_train, Variation, Variation, 50, NParameters)
+        y0_train = NormalizedResult(ReCalculateTargetFunctional(xy0_train, CorrectedTargetResult, WeightResult), NormalizationCoefficients[NParameters]) # 2. Convert simulated macroscopic responses into scalar objective values.
+        NAPoints, x_train, y_train, x_border, iBestParameters = GetNewArrayOfPoints(x0_train, y0_train, Variation, Variation, 50, NParameters) # 3. Select points near the current best solution for local surrogate training.
         #print('M ', ResultMaterialDataPoints[iBestParameters][0:7])        
         l_material = ResultMaterialDataPoints[iBestParameters][0:7]
         l_Command = TemplateCommand.copy()            
@@ -724,7 +846,7 @@ async def main():
     
     # Specify the file path
     
-    
+    # 4. If the local region has too few data points, run extra DEM simulations.
     if NPrePoints > 0 :
         SetNTasks(Commands, NPrePoints, MaterialBorderParameters, MaterialFixParameters, TemplateCommand, NParameters, NFixParameters)
         await run_tasks(Commands, NGPUs, indexGPUs, Queue, TemplatePattern, ResultMaterialDataPoints, FilePath)
@@ -770,11 +892,11 @@ async def main():
         #print('X:',x_train)
         #print('Y:',y_train)  
         #exit(0)
-        mlp.fit(x_train,y_train)
-        ret = dual_annealing(Material_Surface, x_border)
-        Material = ReNormalizedParameters(ret.x, NormalizationCoefficients, NParameters)
+        mlp.fit(x_train,y_train) # 5. Train MLP surrogate on the local normalized dataset.
+        ret = dual_annealing(Material_Surface, x_border) # 6. Optimize the surrogate objective using Dual Annealing.
+        Material = ReNormalizedParameters(ret.x, NormalizationCoefficients, NParameters) # 7. Convert normalized optimized parameters back to physical DEM units.
         print('ret ',ret.x, ' | ', ret.fun, ' | ', counter, ' | ', Material)
-        SetNTasksVariation(Commands, NGPUs, MaterialBorderParameters, MaterialFixParameters, Material, 0.2, TemplateCommand, NParameters, NFixParameters)
+        SetNTasksVariation(Commands, NGPUs, MaterialBorderParameters, MaterialFixParameters, Material, 0.2, TemplateCommand, NParameters, NFixParameters) # 8. Run new DEM simulations around the proposed optimum.
         #exit(0)
         await run_tasks(Commands, NGPUs, indexGPUs, Queue, TemplatePattern, ResultMaterialDataPoints, FilePath)
         #exit(0)
@@ -803,7 +925,7 @@ async def main():
                 l_file.write(' ')                
                 l_file.write(ls_result)
                 l_file.write('\n')
-            CoeffToMusen[0] = ResultMaterialDataPoints[iBestParameters][6]/MusenResult[0]
+            CoeffToMusen[0] = ResultMaterialDataPoints[iBestParameters][6]/MusenResult[0]  # Update correction factors using the ratio between RockFit-DEM prediction and direct MUSEN post-processed response.
             CoeffToMusen[1] = ResultMaterialDataPoints[iBestParameters][7]/MusenResult[1]
             CoeffToMusen[4] = ResultMaterialDataPoints[iBestParameters][11]/MusenResult[2]
             l_musenstep+=1
